@@ -669,7 +669,7 @@ local function update_ui()
                 end
                 
                 -- Add pop items indicator
-                local pop_indicator = has_all and '\\cs(0,255,0)[READY]\\cr' or '\\cs(255,128,0)[NEEDS]\\cr'
+                local pop_indicator = has_all and '\\cs(0,255,0)[READY]\\cr' or '\\cs(255,128,0)[NEED]\\cr'
                 table.insert(lines, string.format('  %s%s %s', location_str, main_indicator, pop_indicator))
                 table.insert(lines, string.format('    Pop: %s', table.concat(pop_status, ', ')))
             else
@@ -1304,4 +1304,5 @@ end)
 windower.register_event('unload', function()
     if display_box then display_box:destroy() end
 end)
+
 
