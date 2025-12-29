@@ -1,0 +1,12 @@
+-- abFarm Settings
+enabled = true
+last_config = "glavoid"
+show_timers = true
+update_rate_inventory = 2
+font_size = 10
+show_enemies = true
+update_rate_key_items = 2
+show_location = true
+show_items = true
+pos_y = 0
+pos_x = 0
