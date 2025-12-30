@@ -1,6 +1,6 @@
 _addon.name = 'abFarm'
-_addon.author = 'abFarm'
-_addon.version = '1.0.0'
+_addon.author = 'jaku'
+_addon.version = '1.1.0'
 _addon.commands = {'abfarm', 'abf'}
 
 require('logger')
@@ -21,6 +21,7 @@ local defaults = {
     show_items = true,
     show_timers = true,
     show_enemies = true,
+    hide_ready_enemies = false,  -- Hide enemies when all pop items are obtained
     update_rate_key_items = 2.0,  -- Update key items every X seconds
     update_rate_inventory = 2.0,   -- Update inventory items every X seconds
     last_config = nil,  -- Remember last loaded config
@@ -119,16 +120,20 @@ load_config()
 
 -- Unified data structures (will be loaded from config files)
 local farm_config = {
+    -- Config-level zone info (applies to all enemies and trade locations)
+    zone = nil,      -- Zone name (optional, for display)
+    zone_id = nil,   -- Zone ID (required, for zone matching)
+    
     -- Items: {name = {id = number, type = 'key'|'item', count = number, has = bool}}
     items = {},
     
     -- Tracked items (for counting): {name = count}
     tracked_items = {},
     
-    -- Enemies: {name = {zone = string, pos = string, x/y/z = number, tracked = bool, spawnType = 'pop'|'timer'|'lottery'|'default', popItems = {array}}}
+    -- Enemies: {name = {pos = string, x/y/z = number, tracked = bool, spawnType = 'pop'|'timer'|'lottery'|'default', popItems = {array}}}
     enemies = {},
     
-    -- Trade locations: {name = {zone = string, pos = string, items = {array}}}
+    -- Trade locations: {name = {pos = string, x/y/z = number (optional), items = {array}}}
     trade_locations = {},
 }
 
@@ -141,6 +146,12 @@ local kill_timers = {}     -- Kill timers for timer-based enemies
 
 -- UI drag tracking
 local drag_save_timer = nil  -- Timer to debounce drag saves
+
+-- Track how many scans we haven't seen enemies (to prevent flickering)
+local enemy_not_seen_count = {}  -- {enemy_name = count}
+
+-- Flag to disable auto-hide (for testing or when zone_id unavailable)
+local disable_auto_hide = false
 
 -- List available config files
 local function list_configs()
@@ -259,10 +270,17 @@ local function load_farm_config(config_name, is_fallback)
     end
     
     -- Validate and load the config
+    farm_config.zone = config.zone or nil
+    farm_config.zone_id = config.zone_id or nil
     farm_config.items = config.items or {}
     farm_config.tracked_items = config.tracked_items or {}
     farm_config.enemies = config.enemies or {}
     farm_config.trade_locations = config.trade_locations or {}
+    
+    -- Validate zone_id is set
+    if not farm_config.zone_id then
+        windower.add_to_chat(8, string.format('[abFarm] Warning: Config "%s" does not have zone_id set. UI will not auto-hide.', config_name))
+    end
     
     -- Initialize item tracking states
     for item_name, item_data in pairs(farm_config.items) do
@@ -450,8 +468,57 @@ local function get_player_pos()
     return mob.x, mob.y, mob.z
 end
 
--- Get current zone
-local function get_current_zone()
+-- Calculate distance between two 3D points
+local function calculate_distance(x1, y1, z1, x2, y2, z2)
+    if not x1 or not y1 or not z1 or not x2 or not y2 or not z2 then
+        return nil
+    end
+    local dx = x2 - x1
+    local dy = y2 - y1
+    local dz = z2 - z1
+    return math.sqrt(dx*dx + dy*dy + dz*dz)
+end
+
+-- Get current zone ID
+local function get_current_zone_id()
+    -- Try multiple methods to get zone ID
+    local info = windower.ffxi.get_info()
+    if info then
+        if info.zone_id then
+            return info.zone_id
+        end
+        -- Sometimes zone_id is in a different field
+        if info.zone and type(info.zone) == 'number' then
+            return info.zone
+        end
+    end
+    
+    -- Fallback: try to get from player
+    local player = windower.ffxi.get_player()
+    if player then
+        if player.zone_id then
+            return player.zone_id
+        end
+        -- Sometimes zone_id is in a different field
+        if player.zone and type(player.zone) == 'number' then
+            return player.zone
+        end
+    end
+    
+    -- Try to get from mob array (player's mob entry)
+    local player_obj = windower.ffxi.get_player()
+    if player_obj then
+        local mob = windower.ffxi.get_mob_by_id(player_obj.id)
+        if mob and mob.zone_id then
+            return mob.zone_id
+        end
+    end
+    
+    return nil
+end
+
+-- Get current zone name (for display)
+local function get_current_zone_name()
     local info = windower.ffxi.get_info()
     if info and info.zone then
         return info.zone
@@ -464,6 +531,73 @@ local function get_current_zone()
     end
     
     return 'Unknown'
+end
+
+-- Check if current zone matches any zone in the config
+local function is_zone_matching(debug_mode)
+    debug_mode = debug_mode or false
+    local current_zone_id = get_current_zone_id()
+    local current_zone_name = get_current_zone_name()
+    
+    if debug_mode then
+        windower.add_to_chat(8, string.format('[abFarm DEBUG] is_zone_matching: Current zone_id = %s, Current zone_name = %s', 
+            tostring(current_zone_id), tostring(current_zone_name)))
+        windower.add_to_chat(8, string.format('[abFarm DEBUG] is_zone_matching: Config zone_id = %s, Config zone_name = %s', 
+            tostring(farm_config.zone_id), tostring(farm_config.zone)))
+    end
+    
+    -- First try zone ID matching (most reliable)
+    if current_zone_id then
+        -- Check config-level zone_id (applies to all enemies and trade locations)
+        if farm_config.zone_id and farm_config.zone_id == current_zone_id then
+            if debug_mode then
+                windower.add_to_chat(8, '[abFarm DEBUG] is_zone_matching: Match found at config level (by ID)!')
+            end
+            return true
+        end
+        
+        -- Check enemies (for per-enemy zone_id overrides)
+        for enemy_name, enemy_data in pairs(farm_config.enemies) do
+            if enemy_data and enemy_data.zone_id then
+                if enemy_data.zone_id == current_zone_id then
+                    if debug_mode then
+                        windower.add_to_chat(8, string.format('[abFarm DEBUG] is_zone_matching: Match found for enemy %s (by ID)!', enemy_name))
+                    end
+                    return true
+                end
+            end
+        end
+        
+        -- Check trade locations (for per-trade zone_id overrides)
+        for trade_name, trade_data in pairs(farm_config.trade_locations) do
+            if trade_data and trade_data.zone_id then
+                if trade_data.zone_id == current_zone_id then
+                    if debug_mode then
+                        windower.add_to_chat(8, string.format('[abFarm DEBUG] is_zone_matching: Match found for trade %s (by ID)!', trade_name))
+                    end
+                    return true
+                end
+            end
+        end
+    end
+    
+    -- Fallback: try zone name matching if zone_id is not available
+    if current_zone_name and current_zone_name ~= 'Unknown' and farm_config.zone then
+        -- Convert to strings if they're numbers
+        local zone_name_str = tostring(current_zone_name)
+        local config_zone_str = tostring(farm_config.zone)
+        if zone_name_str:lower() == config_zone_str:lower() then
+            if debug_mode then
+                windower.add_to_chat(8, '[abFarm DEBUG] is_zone_matching: Match found at config level (by name fallback)!')
+            end
+            return true
+        end
+    end
+    
+    if debug_mode then
+        windower.add_to_chat(8, '[abFarm DEBUG] is_zone_matching: No match found')
+    end
+    return false
 end
 
 -- Format time string
@@ -523,14 +657,40 @@ local function create_ui()
 end
 
 -- Update UI
-local function update_ui()
+local function update_ui(debug_mode)
+    debug_mode = debug_mode or false
+    
     if not display_box then
+        if debug_mode then
+            windower.add_to_chat(8, '[abFarm DEBUG] update_ui: Creating display_box')
+        end
         create_ui()
     end
     
     if not settings.enabled then
+        if debug_mode then
+            windower.add_to_chat(8, '[abFarm DEBUG] update_ui: Settings.enabled is false, hiding UI')
+        end
         if display_box then display_box:hide() end
         return
+    end
+    
+    -- Auto-hide if not in a matching zone (unless disabled)
+    if not disable_auto_hide then
+        local zone_match = is_zone_matching(debug_mode)
+        if not zone_match then
+            if debug_mode then
+                windower.add_to_chat(8, '[abFarm DEBUG] update_ui: Zone not matching, hiding UI')
+            end
+            if display_box then display_box:hide() end
+            return
+        end
+    elseif debug_mode then
+        windower.add_to_chat(8, '[abFarm DEBUG] update_ui: Auto-hide disabled, showing UI anyway')
+    end
+    
+    if debug_mode then
+        windower.add_to_chat(8, '[abFarm DEBUG] update_ui: Zone matches, showing UI')
     end
     
     local lines = {}
@@ -546,13 +706,168 @@ local function update_ui()
     
     -- Current position
     if settings.show_location then
-        local zone = get_current_zone()
+        local zone_name = get_current_zone_name()
         local x, y, z = get_player_pos()
         if x and y then
-            table.insert(lines, string.format('\\cs(200,200,255)Zone: %s\\cr', zone))
+            table.insert(lines, string.format('\\cs(200,200,255)Zone: %s\\cr', zone_name))
             table.insert(lines, string.format('\\cs(200,200,255)Pos: %.1f, %.1f\\cr', x, y))
+            
+            -- Show distance to visible tracked enemies (only if they're actually visible in current scan)
+            local visible_enemies = {}
+            -- First, do a quick scan to see which enemies are actually present right now
+            local current_visible = {}
+            local mobs = windower.ffxi.get_mob_array()
+            if mobs then
+                for id, mob in pairs(mobs) do
+                    if mob and mob.name and mob.distance and mob.distance <= 100 then
+                        local mob_name = mob.name
+                        local enemy_data = farm_config.enemies[mob_name]
+                        if enemy_data and enemy_data.tracked then
+                            current_visible[mob_name] = true
+                        end
+                    end
+                end
+            end
+            
+            -- Only show enemies that are both tracked AND currently visible
+            for enemy_name, enemy_data in pairs(farm_config.enemies) do
+                if enemy_data and enemy_data.tracked and current_visible[enemy_name] then
+                    -- Check if enemy has a valid exact position (not 0,0)
+                    if enemy_data.x ~= 0 or enemy_data.y ~= 0 then
+                        if enemy_data.x and enemy_data.y and enemy_data.z then
+                            local distance = calculate_distance(x, y, z, enemy_data.x, enemy_data.y, enemy_data.z)
+                            if distance then
+                                table.insert(visible_enemies, {
+                                    name = enemy_name,
+                                    distance = distance,
+                                    mainTarget = enemy_data.mainTarget or false
+                                })
+                            end
+                        end
+                    end
+                end
+            end
+            
+            -- Only show "Nearby Enemies" section if there are any
+            if #visible_enemies > 0 then
+                table.insert(lines, '\\cs(150,255,150)Nearby Enemies:\\cr')
+                -- Sort: mainTargets first, then by distance
+                table.sort(visible_enemies, function(a, b)
+                    if a.mainTarget ~= b.mainTarget then
+                        return a.mainTarget  -- mainTargets first
+                    end
+                    return a.distance < b.distance  -- Then by distance
+                end)
+                
+                for _, enemy in ipairs(visible_enemies) do
+                    local target_indicator = enemy.mainTarget and '\\cs(255,255,0)[MAIN]\\cr ' or ''
+                    table.insert(lines, string.format('  %s%s: %.1f yalms', target_indicator, enemy.name, enemy.distance))
+                end
+            end
+            
+            -- Show nearby trade locations and pop locations (within 50 yalms)
+            -- Zone is already checked at the config level, so we can skip zone checking here
+            local nearby_spots = {}
+            
+            -- Check trade_locations (actual trade spots)
+            for trade_name, trade_data in pairs(farm_config.trade_locations) do
+                if trade_data then
+                    -- Check if we have exact coordinates
+                    if trade_data.x and trade_data.y and trade_data.z then
+                        local distance = calculate_distance(x, y, z, trade_data.x, trade_data.y, trade_data.z)
+                        if distance and distance <= 50 then
+                            table.insert(nearby_spots, {
+                                name = trade_name,
+                                distance = distance,
+                                pos = trade_data.pos or 'Unknown',
+                                type = 'trade'
+                            })
+                        end
+                    end
+                end
+            end
+            
+            -- Check enemies with showPopLocation flag or mainTarget (pop/spawn locations to show when nearby)
+            for enemy_name, enemy_data in pairs(farm_config.enemies) do
+                -- Show if: has showPopLocation flag, OR is mainTarget with coordinates
+                local should_show = false
+                if enemy_data and enemy_data.showPopLocation then
+                    should_show = true
+                elseif enemy_data and enemy_data.mainTarget and enemy_data.x and enemy_data.y and enemy_data.z and (enemy_data.x ~= 0 or enemy_data.y ~= 0) then
+                    -- MainTarget enemies with coordinates should also show as spawn locations
+                    should_show = true
+                end
+                
+                if should_show then
+                    -- Check if we have exact coordinates
+                    if enemy_data.x and enemy_data.y and enemy_data.z and (enemy_data.x ~= 0 or enemy_data.y ~= 0) then
+                        local distance = calculate_distance(x, y, z, enemy_data.x, enemy_data.y, enemy_data.z)
+                        if distance and distance <= 50 then
+                            table.insert(nearby_spots, {
+                                name = enemy_name .. ' ???',
+                                distance = distance,
+                                pos = enemy_data.pos or 'Unknown',
+                                type = 'pop'
+                            })
+                        end
+                    end
+                end
+            end
+            
+            -- Show nearby spots section if any are nearby
+            if #nearby_spots > 0 then
+                -- Sort by distance
+                table.sort(nearby_spots, function(a, b)
+                    return a.distance < b.distance
+                end)
+                
+                table.insert(lines, '\\cs(255,200,150)Nearby Spots:\\cr')
+                for _, spot in ipairs(nearby_spots) do
+                    -- Show the location and distance - items are shown in the Items section with indicators
+                    table.insert(lines, string.format('  %s (%s): %.1f yalms', spot.name, spot.pos, spot.distance))
+                end
+            end
         end
         table.insert(lines, '')
+    end
+    
+    -- Helper function to find where an item is used
+    -- Prioritizes pop items over trade locations (pop items are more direct/important)
+    local function get_item_usage(item_name)
+        local usages = {}
+        local is_pop_item = false
+        
+        -- Check enemies (pop items) - these take priority
+        for enemy_name, enemy_data in pairs(farm_config.enemies) do
+            if enemy_data and enemy_data.popItems then
+                for _, pop_item in ipairs(enemy_data.popItems) do
+                    if pop_item == item_name then
+                        table.insert(usages, enemy_name)
+                        is_pop_item = true
+                        break
+                    end
+                end
+            end
+        end
+        
+        -- Only check trade locations if item is NOT used as a pop item
+        -- (pop items are more important, trade locations are secondary/alternative uses)
+        if not is_pop_item then
+            for trade_name, trade_data in pairs(farm_config.trade_locations) do
+                if trade_data and trade_data.items then
+                    for _, trade_item in ipairs(trade_data.items) do
+                        if trade_item == item_name then
+                            -- Extract a short name from trade location (remove "Spawn" or "Trade" suffix)
+                            local short_name = trade_name:gsub(' Spawn$', ''):gsub(' Trade$', '')
+                            table.insert(usages, short_name)
+                            break
+                        end
+                    end
+                end
+            end
+        end
+        
+        return usages
     end
     
     -- Items Status
@@ -572,18 +887,85 @@ local function update_ui()
             table.insert(lines, '\\cs(255,200,0)Key Items:\\cr')
             for _, item in ipairs(key_items_list) do
                 local status = item.has and '\\cs(0,255,0)O\\cr' or '\\cs(255,0,0)X\\cr'
-                table.insert(lines, string.format('  %s %s', status, item.name))
+                local usages = get_item_usage(item.name)
+                local usage_str = ''
+                if #usages > 0 then
+                    -- Show usage indicators (max 2 to keep it compact)
+                    local display_usages = {}
+                    for i = 1, math.min(2, #usages) do
+                        table.insert(display_usages, usages[i])
+                    end
+                    usage_str = string.format(' \\cs(150,150,255)[%s]\\cr', table.concat(display_usages, ', '))
+                    if #usages > 2 then
+                        usage_str = usage_str .. string.format('\\cs(150,150,255)+%d\\cr', #usages - 2)
+                    end
+                end
+                table.insert(lines, string.format('  %s %s%s', status, item.name, usage_str))
             end
             table.insert(lines, '')
         end
         
-        -- Trade Items
+        -- Trade Items - Group by enemy usage
         if #trade_items_list > 0 then
             table.insert(lines, '\\cs(255,200,0)Trade Items:\\cr')
+            
+            -- Helper to get primary usage (first enemy) for grouping
+            local function get_primary_usage(item_name)
+                local usages = get_item_usage(item_name)
+                if #usages > 0 then
+                    return usages[1]  -- Return first usage (primary enemy)
+                end
+                return ''  -- No usage, will be grouped at the end
+            end
+            
+            -- Group items by their primary usage
+            local grouped_items = {}
             for _, item in ipairs(trade_items_list) do
-                local status = item.has and '\\cs(0,255,0)O\\cr' or '\\cs(255,0,0)X\\cr'
-                local count_str = item.count > 0 and string.format(' (%d)', item.count) or ''
-                table.insert(lines, string.format('  %s %s%s', status, item.name, count_str))
+                local primary_usage = get_primary_usage(item.name)
+                if not grouped_items[primary_usage] then
+                    grouped_items[primary_usage] = {}
+                end
+                table.insert(grouped_items[primary_usage], item)
+            end
+            
+            -- Sort groups: enemies first (alphabetically), then items with no usage
+            local group_order = {}
+            for usage, _ in pairs(grouped_items) do
+                if usage ~= '' then
+                    table.insert(group_order, usage)
+                end
+            end
+            table.sort(group_order)  -- Sort enemy names alphabetically
+            
+            -- Add empty usage group at the end if it exists
+            if grouped_items[''] then
+                table.insert(group_order, '')
+            end
+            
+            -- Display grouped items
+            for _, usage in ipairs(group_order) do
+                local items = grouped_items[usage]
+                -- Sort items within group alphabetically
+                table.sort(items, function(a, b) return a.name < b.name end)
+                
+                for _, item in ipairs(items) do
+                    local status = item.has and '\\cs(0,255,0)O\\cr' or '\\cs(255,0,0)X\\cr'
+                    local count_str = item.count > 0 and string.format(' (%d)', item.count) or ''
+                    local usages = get_item_usage(item.name)
+                    local usage_str = ''
+                    if #usages > 0 then
+                        -- Show usage indicators (max 2 to keep it compact)
+                        local display_usages = {}
+                        for i = 1, math.min(2, #usages) do
+                            table.insert(display_usages, usages[i])
+                        end
+                        usage_str = string.format(' \\cs(150,150,255)[%s]\\cr', table.concat(display_usages, ', '))
+                        if #usages > 2 then
+                            usage_str = usage_str .. string.format('\\cs(150,150,255)+%d\\cr', #usages - 2)
+                        end
+                    end
+                    table.insert(lines, string.format('  %s %s%s%s', status, item.name, count_str, usage_str))
+                end
             end
             table.insert(lines, '')
         end
@@ -604,28 +986,72 @@ local function update_ui()
     if settings.show_enemies then
         table.insert(lines, '\\cs(255,200,0)Enemy Locations:\\cr')
         
-        -- Sort enemies: mainTarget first, then others
+        -- Helper function to check if all pop items for an enemy are obtained
+        local function has_all_pop_items(enemy_data)
+            if not enemy_data.popItems or #enemy_data.popItems == 0 then
+                return false  -- No pop items means not "ready"
+            end
+            
+            for _, pop_item in ipairs(enemy_data.popItems) do
+                local item_data = farm_config.items[pop_item]
+                if not item_data or not item_data.has then
+                    return false  -- Missing at least one item
+                end
+            end
+            
+            return true  -- All items obtained
+        end
+        
+        -- Sort enemies: mainTarget first, then pop, timer, default
         local enemy_list = {}
         local main_targets = {}
-        local other_enemies = {}
+        local pop_enemies = {}
+        local timer_enemies = {}
+        local default_enemies = {}
         
         for enemy_name, enemy_data in pairs(farm_config.enemies) do
-            if enemy_data.mainTarget then
-                table.insert(main_targets, {name = enemy_name, data = enemy_data})
-            else
-                table.insert(other_enemies, {name = enemy_name, data = enemy_data})
+            -- Skip enemies that should be hidden (if setting is enabled)
+            local should_hide = false
+            if settings.hide_ready_enemies then
+                -- Never hide mainTarget enemies
+                if not enemy_data.mainTarget and has_all_pop_items(enemy_data) then
+                    -- All pop items obtained, hide this enemy
+                    should_hide = true
+                end
+            end
+            
+            if not should_hide then
+                local enemy_entry = {name = enemy_name, data = enemy_data}
+                
+                if enemy_data.mainTarget then
+                    table.insert(main_targets, enemy_entry)
+                elseif enemy_data.spawnType == 'pop' then
+                    table.insert(pop_enemies, enemy_entry)
+                elseif enemy_data.spawnType == 'timer' then
+                    table.insert(timer_enemies, enemy_entry)
+                else
+                    table.insert(default_enemies, enemy_entry)
+                end
             end
         end
         
         -- Sort each group alphabetically
         table.sort(main_targets, function(a, b) return a.name < b.name end)
-        table.sort(other_enemies, function(a, b) return a.name < b.name end)
+        table.sort(pop_enemies, function(a, b) return a.name < b.name end)
+        table.sort(timer_enemies, function(a, b) return a.name < b.name end)
+        table.sort(default_enemies, function(a, b) return a.name < b.name end)
         
-        -- Combine: mainTargets first, then others
+        -- Combine in priority order: mainTargets, pop, timer, default
         for _, enemy in ipairs(main_targets) do
             table.insert(enemy_list, enemy)
         end
-        for _, enemy in ipairs(other_enemies) do
+        for _, enemy in ipairs(pop_enemies) do
+            table.insert(enemy_list, enemy)
+        end
+        for _, enemy in ipairs(timer_enemies) do
+            table.insert(enemy_list, enemy)
+        end
+        for _, enemy in ipairs(default_enemies) do
             table.insert(enemy_list, enemy)
         end
         
@@ -671,7 +1097,26 @@ local function update_ui()
                 -- Add pop items indicator
                 local pop_indicator = has_all and '\\cs(0,255,0)[READY]\\cr' or '\\cs(255,128,0)[NEED]\\cr'
                 table.insert(lines, string.format('  %s%s %s', location_str, main_indicator, pop_indicator))
-                table.insert(lines, string.format('    Pop: %s', table.concat(pop_status, ', ')))
+                -- Display pop items with max 2 per line
+                if #pop_status == 1 then
+                    -- 1 item: show on one line
+                    table.insert(lines, string.format('    Pop: %s', pop_status[1]))
+                elseif #pop_status == 2 then
+                    -- 2 items: show on one line
+                    table.insert(lines, string.format('    Pop: %s, %s', pop_status[1], pop_status[2]))
+                else
+                    -- 3+ items: show 2 per line
+                    table.insert(lines, string.format('    Pop: %s, %s', pop_status[1], pop_status[2]))
+                    for i = 3, #pop_status, 2 do
+                        if i + 1 <= #pop_status then
+                            -- Two items on this line
+                            table.insert(lines, string.format('         %s, %s', pop_status[i], pop_status[i + 1]))
+                        else
+                            -- Last item alone
+                            table.insert(lines, string.format('         %s', pop_status[i]))
+                        end
+                    end
+                end
             else
                 table.insert(lines, string.format('  %s%s', location_str, main_indicator))
             end
@@ -754,6 +1199,11 @@ windower.register_event('action', function(act)
                 -- Check if it's a tracked timer-based enemy
                 if enemy_data and enemy_data.tracked and enemy_data.spawnType == 'timer' then
                     kill_timers[mob_name] = os.time()
+                    -- Immediately clear exact position since enemy is dead
+                    enemy_data.x = 0
+                    enemy_data.y = 0
+                    enemy_data.z = 0
+                    enemy_not_seen_count[mob_name] = 0
                     windower.add_to_chat(8, string.format('[abFarm] %s killed! Timer started.', mob_name))
                     update_items()
                     update_ui()
@@ -777,6 +1227,11 @@ windower.register_event('action', function(act)
                             -- Check if it's a tracked timer-based enemy
                             if enemy_data and enemy_data.tracked and enemy_data.spawnType == 'timer' then
                                 kill_timers[mob_name] = os.time()
+                                -- Immediately clear exact position since enemy is dead
+                                enemy_data.x = 0
+                                enemy_data.y = 0
+                                enemy_data.z = 0
+                                enemy_not_seen_count[mob_name] = 0
                                 windower.add_to_chat(8, string.format('[abFarm] %s killed! Timer started.', mob_name))
                                 update_items()
                                 update_ui()
@@ -813,6 +1268,14 @@ windower.register_event('incoming text', function(original, modified, mode)
                         -- Only update if we don't have a recent timer
                         if kill_timers[enemy_name] == nil or (os.time() - kill_timers[enemy_name]) > 5 then
                             kill_timers[enemy_name] = os.time()
+                            -- Immediately clear exact position since enemy is dead
+                            local enemy_data = farm_config.enemies[enemy_name]
+                            if enemy_data then
+                                enemy_data.x = 0
+                                enemy_data.y = 0
+                                enemy_data.z = 0
+                                enemy_not_seen_count[enemy_name] = 0
+                            end
                             windower.add_to_chat(8, string.format('[abFarm] %s killed! Timer started (text detection).', enemy_name))
                             update_items()
                             update_ui()
@@ -838,6 +1301,7 @@ local function scan_enemy_positions()
     if not mobs then return false end
     
     local max_distance = 100  -- Maximum distance to scan (in game units)
+    local found_enemies = {}  -- Track which enemies we found in this scan
     
     -- Iterate through all mobs returned
     for id, mob in pairs(mobs) do
@@ -852,9 +1316,35 @@ local function scan_enemy_positions()
                         enemy_data.x = mob.x
                         enemy_data.y = mob.y
                         enemy_data.z = mob.z
+                        found_enemies[mob_name] = true
+                        enemy_not_seen_count[mob_name] = 0  -- Reset counter
                         found_any = true
                     end
                 end
+            end
+        end
+    end
+    
+    -- Clear positions for tracked enemies that are no longer visible
+    -- But only after multiple scans (to prevent flickering and preserve positions between scans)
+    for enemy_name, enemy_data in pairs(farm_config.enemies) do
+        if enemy_data and enemy_data.tracked then
+            -- If we had an exact position but didn't find the enemy this scan
+            if (enemy_data.x ~= 0 or enemy_data.y ~= 0) and not found_enemies[enemy_name] then
+                -- Increment the "not seen" counter
+                enemy_not_seen_count[enemy_name] = (enemy_not_seen_count[enemy_name] or 0) + 1
+                
+                -- Only clear after 3 consecutive scans of not seeing them (prevents flickering)
+                if enemy_not_seen_count[enemy_name] >= 3 then
+                    -- Clear exact position but preserve the original grid position (pos)
+                    enemy_data.x = 0
+                    enemy_data.y = 0
+                    enemy_data.z = 0
+                    enemy_not_seen_count[enemy_name] = 0  -- Reset counter
+                end
+            elseif found_enemies[enemy_name] then
+                -- Reset counter if we found them
+                enemy_not_seen_count[enemy_name] = 0
             end
         end
     end
@@ -927,6 +1417,14 @@ local function track_mobs()
                 
                 if should_update then
                     kill_timers[enemy_name] = os.time()
+                    -- Immediately clear exact position since enemy is dead
+                    local enemy_data = farm_config.enemies[enemy_name]
+                    if enemy_data then
+                        enemy_data.x = 0
+                        enemy_data.y = 0
+                        enemy_data.z = 0
+                        enemy_not_seen_count[enemy_name] = 0
+                    end
                     windower.add_to_chat(8, string.format('[abFarm] %s killed! Timer started (mob tracking).', enemy_name))
                     update_items()
                     update_ui()
@@ -1082,9 +1580,19 @@ windower.register_event('addon command', function(command, ...)
     
     if command == 'toggle' or command == 't' then
         settings.enabled = not settings.enabled
+        -- Re-enable auto-hide when toggling (in case it was disabled for testing)
+        if settings.enabled then
+            disable_auto_hide = false
+        end
         save_config()
         update_ui()
         windower.add_to_chat(8, string.format('[abFarm] %s', settings.enabled and 'Enabled' or 'Disabled'))
+        
+    elseif command == 'hide' or command == 'hide-ready' then
+        settings.hide_ready_enemies = not settings.hide_ready_enemies
+        save_config()
+        update_ui()
+        windower.add_to_chat(8, string.format('[abFarm] Hide ready enemies: %s', settings.hide_ready_enemies and 'ON' or 'OFF'))
         
     elseif command == 'pos' or command == 'position' then
         if #args >= 2 then
@@ -1234,10 +1742,39 @@ windower.register_event('addon command', function(command, ...)
         update_ui()
         
     elseif command == 'debug' or command == 'd' then
+        -- UI Visibility Debug
+        windower.add_to_chat(8, '=== UI Visibility Debug ===')
+        windower.add_to_chat(8, string.format('  settings.enabled: %s', tostring(settings.enabled)))
+        windower.add_to_chat(8, string.format('  display_box exists: %s', tostring(display_box ~= nil)))
+        if display_box then
+            if display_box.visible then
+                local is_visible = display_box:visible()
+                windower.add_to_chat(8, string.format('  display_box:visible(): %s', tostring(is_visible)))
+            else
+                windower.add_to_chat(8, '  display_box:visible() method not available')
+            end
+        end
+        
+        -- Zone Debug
+        local current_zone_id = get_current_zone_id()
+        local current_zone_name = get_current_zone_name()
+        windower.add_to_chat(8, string.format('  Current zone: %s (ID: %s)', current_zone_name, tostring(current_zone_id)))
+        windower.add_to_chat(8, string.format('  Config zone: %s (ID: %s)', tostring(farm_config.zone), tostring(farm_config.zone_id)))
+        windower.add_to_chat(8, string.format('  Current config loaded: %s', tostring(current_config_name)))
+        
+        -- Zone matching
+        local zone_match = is_zone_matching(true)  -- Enable debug mode
+        windower.add_to_chat(8, string.format('  Zone matches: %s', tostring(zone_match)))
+        
+        -- Force UI update with debug
+        windower.add_to_chat(8, '=== Forcing UI update with debug ===')
+        update_ui(true)  -- Enable debug mode
+        
         -- Check key items using the API like findAll does
+        windower.add_to_chat(8, '=== Key Items Debug ===')
         local key_items_list = windower.ffxi.get_key_items()
         if key_items_list then
-            windower.add_to_chat(8, string.format('[abFarm] Debug - Found %d key items using get_key_items()', #key_items_list))
+            windower.add_to_chat(8, string.format('  Found %d key items using get_key_items()', #key_items_list))
             if #key_items_list > 0 then
                 windower.add_to_chat(8, '  First 10 key item IDs:')
                 for i = 1, math.min(10, #key_items_list) do
@@ -1245,21 +1782,21 @@ windower.register_event('addon command', function(command, ...)
                 end
             end
         else
-            windower.add_to_chat(8, '[abFarm] Debug - get_key_items() returned nil')
+            windower.add_to_chat(8, '  get_key_items() returned nil')
         end
         
         -- Try to find our key items
-        windower.add_to_chat(8, '[abFarm] Checking for specific key items:')
+        windower.add_to_chat(8, '  Checking for specific key items:')
         for item_name, item_data in pairs(farm_config.items) do
             if item_data.type == 'key' then
                 local has_it = has_key_item(item_name)
                 local id_str = item_data.id and string.format(' (ID: %d)', item_data.id) or ' (ID: unknown)'
-                windower.add_to_chat(8, string.format('  %s%s: %s', item_name, id_str, has_it and 'FOUND' or 'NOT FOUND'))
+                windower.add_to_chat(8, string.format('    %s%s: %s', item_name, id_str, has_it and 'FOUND' or 'NOT FOUND'))
             end
         end
         
         -- Debug tracked items
-        windower.add_to_chat(8, '[abFarm] Tracked items:')
+        windower.add_to_chat(8, '=== Tracked Items Debug ===')
         for item_name, tracked_data in pairs(farm_config.tracked_items) do
             if type(tracked_data) == 'table' then
                 local id_str = tracked_data.id and string.format(' (ID: %d)', tracked_data.id) or ' (ID: unknown)'
@@ -1272,9 +1809,35 @@ windower.register_event('addon command', function(command, ...)
             end
         end
         
+    elseif command == 'test' or command == 'show' then
+        -- Force show UI for testing (bypasses all checks)
+        windower.add_to_chat(8, '[abFarm] Force showing UI for testing...')
+        disable_auto_hide = true  -- Temporarily disable auto-hide
+        if not display_box then
+            create_ui()
+        end
+        if display_box then
+            settings.enabled = true
+            display_box:show()
+            -- Force update with test content
+            display_box:clear()
+            display_box:append('\\cs(255,255,0)=== TEST UI ===\\cr\n')
+            display_box:append('If you can see this, the UI is working!\n')
+            display_box:append(string.format('Zone: %s (ID: %s)\n', get_current_zone_name(), tostring(get_current_zone_id())))
+            display_box:append(string.format('Config: %s\n', tostring(current_config_name)))
+            display_box:append(string.format('Config Zone ID: %s\n', tostring(farm_config.zone_id)))
+            display_box:append(string.format('Config Zone Name: %s\n', tostring(farm_config.zone)))
+            -- Force a normal UI update so it shows real content
+            update_ui()
+            windower.add_to_chat(8, '[abFarm] UI should now be visible. Use //abfarm toggle to re-enable auto-hide.')
+        else
+            windower.add_to_chat(8, '[abFarm] ERROR: Could not create display_box!')
+        end
+        
     elseif command == 'help' or command == 'h' then
         windower.add_to_chat(8, '[abFarm] Commands:')
         windower.add_to_chat(8, '  //abfarm toggle - Toggle display on/off')
+        windower.add_to_chat(8, '  //abfarm hide - Toggle hiding enemies with all pop items')
         windower.add_to_chat(8, '  //abfarm load <name> - Load farm configuration')
         windower.add_to_chat(8, '  //abfarm pos <x> <y> - Set UI position')
         --windower.add_to_chat(8, '  //abfarm font <size> - Set font size')
@@ -1304,5 +1867,4 @@ end)
 windower.register_event('unload', function()
     if display_box then display_box:destroy() end
 end)
-
 
